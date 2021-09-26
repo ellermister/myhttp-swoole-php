@@ -1,28 +1,56 @@
 <?php
 
+/**
+ * 基于 Swoole 创建的 MyHTTP 服务
+ * 主要：支持大文件上传
+ *
+ * Class MyHTTP
+ */
 class MyHTTP
 {
 
+    /**
+     * 绑定的 IP 地址
+     *
+     * @var string
+     */
     protected $bind_ip;
+
+    /**
+     * 绑定的端口
+     *
+     * @var int
+     */
     protected $bind_port;
+
+    /**
+     * 链接的数据
+     *
+     * @var array
+     */
     protected $fd_data = [];
 
-    protected $table;
+    /**
+     * 是否开启调试
+     *
+     * @var bool
+     */
+    public $debug = false;
+
 
     public function __construct($ip, $port)
     {
         $this->bind_ip = $ip;
         $this->bind_port = $port;
 
-        $this->table = new Swoole\Table(1024);
-        $this->table->column('is_parse_head', Swoole\Table::TYPE_INT);
-        $this->table->column('is_completed', Swoole\Table::TYPE_INT);
-        $this->table->column('require_length', Swoole\Table::TYPE_INT);
-        $this->table->column('recv_length', Swoole\Table::TYPE_INT);
-        $this->table->column('cid', Swoole\Table::TYPE_INT);
-        $this->table->create();
-
-        $server = new Swoole\Server($ip, $port);
+        $server = new Swoole\Server($ip, $port, SWOOLE_PROCESS);
+        $server->set(array(
+            'reactor_num'   => swoole_cpu_num() * 2,     // reactor thread num
+            'worker_num'    => swoole_cpu_num() * 2,     // worker process num
+            'backlog'       => 128,   // listen backlog
+            'max_request'   => 0,
+            'dispatch_mode' => 2,
+        ));
 
         $server->on('start', [$this, 'onStart']);
         $server->on('connect', [$this, 'onConnect']);
@@ -34,32 +62,38 @@ class MyHTTP
 
     public function onStart($server)
     {
-        Swoole\Runtime::enableCoroutine();
+        Swoole\Runtime::enableCoroutine($flags = SWOOLE_HOOK_ALL);
         echo "TCP Server is started at tcp://{$this->bind_ip}\n";
     }
 
     public function onConnect($server, $fd)
     {
         echo "connection open: {$fd}\n";
-        @unlink('aa.txt');
     }
 
+    /**
+     * 处理链接的数据接收
+     * 应考虑 Server 的模式，Base模式是多 worker 进程，需要做进程通信，PROCESS 进程模式链接仅在一个进程处理无需考虑进程通信。
+     *
+     * @param $server
+     * @param $fd
+     * @param $reactor_id
+     * @param $data
+     * @return false
+     */
     public function onReceive($server, $fd, $reactor_id, $data)
     {
-
-//        file_put_contents('aa.txt',$data,FILE_APPEND);
 //        echo sprintf("<< [收到数据请求:]\n%s\n", strlen($data)>200?substr($data,0,200).'...[数据过大]':$data);
-
-        if (!$this->table->exist($fd)) {
-            $this->table->set($fd, [
+        if (!isset($this->fd_data[$fd])) {
+            $this->fd_data[$fd] = [
                 'is_completed'   => 0, // 是否完成
                 'is_parse_head'  => 0, // 是否解析head
                 'require_length' => 0, // 请求需要长度
                 'recv_length'    => 0, // 已经接收长度
-            ]);
+            ];
         }
 
-        if (!$this->table->get($fd, 'is_parse_head')) {
+        if (!$this->fd_data[$fd]['is_parse_head']) {
 
             $this->debugText("<<<<<<<<<<尝试解析header:$fd\n");
             $request = $this->preread_http_request($data);
@@ -67,12 +101,12 @@ class MyHTTP
             $body_pos = strpos($data, hex2bin("0d0a0d0a"));
             $content_length = intval($request['headers']['Content-Length']);
             $recv_length = strlen($data) - $body_pos + strlen(hex2bin("0d0a0d0a"));
-            $this->table->set($fd, [
+            $this->fd_data[$fd] = [
                 'is_parse_head'  => 1,
                 'require_length' => $request['headers']['Content-Length'] ?? 0,
                 'recv_length'    => $recv_length
-            ]);
-            file_put_contents('./tmp/'.$fd, substr($data, $body_pos + strlen(hex2bin("0d0a0d0a"))));
+            ];
+            file_put_contents('./tmp/' . $fd, substr($data, $body_pos + strlen(hex2bin("0d0a0d0a"))));
 
             if ($recv_length >= $content_length) {
                 // 接收完毕
@@ -82,10 +116,8 @@ class MyHTTP
                 $this->debugText(sprintf("<< [未接收完毕]\n"));
                 // 未接收完毕，需要多次接收
                 $cid = Swoole\Coroutine::getuid();
-                $this->debugText(sprintf("<< [让出协程] code => %s\n",$cid));
-                $this->table->set($fd, [
-                    'cid'  => $cid,
-                ]);
+                $this->debugText(sprintf("<< [让出协程] code => %s\n", $cid));
+                $this->fd_data[$fd]['cid'] = $cid;
                 Swoole\Coroutine::yield();
                 $this->debugText(sprintf("<< [恢复协程，准备触发 Request]\n"));
                 $this->onRequest($server, $fd, $request, $data);
@@ -94,35 +126,45 @@ class MyHTTP
         } else {
             $this->debugText(sprintf("<< [分段接收]\n"));
             // 这里接收数据
-            file_put_contents('./tmp/'.$fd, $data,FILE_APPEND);
-            $this->table->incr($fd, 'recv_length', strlen($data));
-            if ($this->table->get($fd,'recv_length') >= $this->table->get($fd,'require_length')) {
-                $this->debugText(sprintf("<< [接收完毕,触发请求] %s == %s\n", $this->table->get($fd,'recv_length'), $this->table->get($fd,'require_length')));
-                $cid = $this->table->get($fd,'cid');
+            file_put_contents('./tmp/' . $fd, $data, FILE_APPEND);
+            $this->fd_data[$fd]['recv_length'] += strlen($data);
+
+            if ($this->fd_data[$fd]['recv_length'] >= $this->fd_data[$fd]['require_length']) {
+                $this->debugText(sprintf("<< [接收完毕,触发请求] %s == %s\n", $this->fd_data[$fd]['recv_length'], $this->fd_data[$fd]['require_length']));
+                $cid = $this->fd_data[$fd]['cid'];
                 Swoole\Coroutine::resume($cid);
-                $this->debugText(sprintf("<< [准备恢复协程，%s]\n",$cid));
-            }else{
+                $this->debugText(sprintf("<< [准备恢复协程，%s]\n", $cid));
+            } else {
                 return false;
             }
 
         }
 
         // 请求完释放内存数据
-        $this->table->del($fd);
+        $this->debugText(sprintf("释放数据拉 => %s\n", $fd));
+        unset($this->fd_data[$fd]);
     }
 
+    /**
+     * 基于 TCP 服务器实现的 HTTP onRequest
+     *
+     * @param $server
+     * @param $fd
+     * @param $request
+     * @param $data
+     */
     public function onRequest($server, $fd, $request, $data)
     {
 
-//        if ($request['method'] == 'POST') {
+        if ($request['method'] == 'POST') {
 //            $payload = $this->parse_http_payload($request, $data);
 //            var_dump($payload);
-//        }
-//        $text = "你请求的地址:" . $request['request_uri'] . '  方法是:' . $request['method'];
-        $text = "ddd";
+        }
+        $text = "你请求的地址:" . $request['request_uri'] . '  方法是:' . $request['method'];
         $raw = $this->build_http_response($this->http_code(200), 'text/html; charset=utf-8', $text);
         $this->debugText(sprintf(">> [回应数请求:]\n%s\n", $raw));
         $server->send($fd, $raw);
+        @unlink('./tmp/' . $fd);
     }
 
     public function onClose($server, $fd)
@@ -130,21 +172,20 @@ class MyHTTP
         echo "connection close: {$fd}\n";
     }
 
+    /**
+     * 解析 HTTP 的 Header 数据
+     *
+     * @param $data
+     * @return false|int[]
+     */
     protected function preread_http_header(&$data)
-    {//ff d8 ff e0
-//    $pos = strpos($data,"\r\n");
-//    var_dump(substr($data,0, $pos));
-
+    {
+        //ff d8 ff e0
         $pos = strpos($data, hex2bin("0d0a0d0a"));
-//        var_dump(substr($data,0,400));
 
         $header = substr($data, 0, $pos);
-//        var_dump('==============================000');
-//        var_dump($header);
-//        var_dump('==============================111');
-//    file_put_contents('./test.txt', $header.PHP_EOL, FILE_APPEND);
         if ($headers = explode("\r\n", $header)) {
-            $key_map = [];
+            $key_map = ['Content-Length' => 0];
             foreach ($headers as $item) {
                 $buffer = explode(":", $item);
                 if (count($buffer) >= 2) {
@@ -161,6 +202,12 @@ class MyHTTP
         }
     }
 
+    /**
+     * 解析 HTTP 请求头数据
+     *
+     * @param $data
+     * @return array
+     */
     protected function preread_http_request(&$data)
     {
 //        var_dump(substr($data,0,200));
@@ -176,6 +223,13 @@ class MyHTTP
         return $request;
     }
 
+    /**
+     * 解析 PAYLOAD BODY 体
+     *
+     * @param array $request
+     * @param string $data
+     * @return array
+     */
     protected function parse_http_payload(array $request, string &$data)
     {
         $payload = [];
@@ -233,7 +287,12 @@ class MyHTTP
         return $payload;
     }
 
-
+    /**
+     * 获取标准 HTTP 状态码
+     *
+     * @param $num
+     * @return string
+     */
     protected function http_code($num)
     {
         $http = array(
@@ -281,6 +340,17 @@ class MyHTTP
         return $http[$num];
     }
 
+    /**
+     * 简单构建 HTTP 响应体
+     *
+     * @param string $code
+     * @param string $content_type
+     * @param string $content
+     * @param string $is_keep_alive
+     * @param int $length
+     * @param array $headers
+     * @return string
+     */
     protected function build_http_response($code = "HTTP/1.1 200 OK", $content_type = "text/plain; charset=UTF-8", $content = "", $is_keep_alive = "close", $length = 0, $headers = [])
     {
         $lastmod = gmdate("D, d M Y H:i:s") . " GMT";
@@ -308,9 +378,14 @@ EOF;
         return $raw;
     }
 
+    /**
+     * 调试输出文本
+     *
+     * @param $text
+     */
     protected function debugText($text)
     {
-//        echo $text;
+        if ($this->debug) echo $text;
     }
 }
 
